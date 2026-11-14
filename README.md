@@ -76,9 +76,9 @@ This does not start a model turn and costs no tokens.
 
 ## What it does
 
-- Kimi device-code OAuth with automatic token refresh and rotation
-- On a 401/403, refreshes the token once and retries the request
-- Credentials are stored per account, so switching accounts never reuses an old token
+- Kimi device-code OAuth; OpenCode Core exclusively refreshes, rotates, and persists credentials
+- On a 401/403, resolves the current Core credential once more and retries only if its access token changed
+- Credentials are always resolved for the active Core account, so switching accounts never reuses an old token
 - `temperature` is pinned to `1`, the only value Kimi Code accepts
 
 ## Development

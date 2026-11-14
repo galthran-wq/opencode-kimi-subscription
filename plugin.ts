@@ -1,7 +1,6 @@
 import { Effect, Stream } from "effect"
 import { Plugin } from "@opencode/plugin/effect"
 import type { ConnectionInfo } from "@opencode/client"
-import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect/integration"
 import {
   DEFAULT_API_BASE,
   DEFAULT_OAUTH_HOST,
@@ -18,7 +17,7 @@ import {
   type ModelCache,
 } from "./internal.ts"
 import { createOAuthClient, createOAuthMethod, fetchDiscoveredModels, type Fetch } from "./oauth.ts"
-import { createPluginCredentialStore, recoverUnauthorized } from "./recovery.ts"
+import { recoverUnauthorized } from "./recovery.ts"
 import { fetchKimiUsage, formatKimiUsage, kimiUsageErrorMessage } from "./usage.ts"
 
 export interface PluginDependencies {
@@ -38,34 +37,14 @@ export function createKimiPlugin(dependencies: PluginDependencies = {}) {
     id: "kimi-subscription",
     effect: Effect.fn("KimiSubscription.setup")(function* (ctx) {
       const oauthClient = createOAuthClient(oauthHost, send)
-      const baseOAuth = createOAuthMethod({ client: oauthClient, now })
-      const refresh = baseOAuth.refresh as NonNullable<IntegrationOAuthMethodRegistration["refresh"]>
-      const credentials = createPluginCredentialStore({
-        storage: ctx.storage,
-        connections: ctx.integration.connection,
-        refresh,
-        now,
-      })
-      const oauth: IntegrationOAuthMethodRegistration = {
-        ...baseOAuth,
-        refresh: (credential) =>
-          Effect.gen(function* () {
-            const before = yield* ctx.integration.connection.active(INTEGRATION_ID)
-            const next = yield* refresh(credential)
-            const after = yield* ctx.integration.connection.active(INTEGRATION_ID)
-            if (before?.type === "credential" && after?.type === "credential" && before.id === after.id) {
-              yield* credentials.adopt(after, next)
-            }
-            return next
-          }),
-      }
+      const oauth = createOAuthMethod({ client: oauthClient, now })
 
       const noAccount = "No active Kimi subscription account. Run /connect and sign in, then try /kimi-usage again."
       const usageText = Effect.gen(function* () {
         const connection = yield* ctx.integration.connection.active(INTEGRATION_ID)
         if (!connection) return noAccount
-        const credential = yield* credentials.get(connection)
-        if (!credential) return noAccount
+        const credential = yield* ctx.integration.connection.resolve(connection)
+        if (credential?.type !== "oauth") return noAccount
         const report = yield* Effect.tryPromise({
           try: (signal) => fetchKimiUsage(apiBase, credential.access, send, signal),
           catch: (cause) => cause,
@@ -145,8 +124,8 @@ export function createKimiPlugin(dependencies: PluginDependencies = {}) {
               return
             }
             yield* publishConnection(connection)
-            const credential = yield* credentials.get(connection)
-            if (!credential) return
+            const credential = yield* ctx.integration.connection.resolve(connection)
+            if (credential?.type !== "oauth") return
             const models = yield* Effect.tryPromise({
               try: (signal) => fetchDiscoveredModels(apiBase, credential.access, send, signal),
               catch: (cause) => new Error(errorMessage(cause)),
@@ -197,9 +176,9 @@ export function createKimiPlugin(dependencies: PluginDependencies = {}) {
         (event) =>
           Effect.gen(function* () {
             const connection = yield* ctx.integration.connection.active(INTEGRATION_ID)
-            const credential = connection ? yield* credentials.get(connection) : undefined
+            const credential = connection ? yield* ctx.integration.connection.resolve(connection) : undefined
             event.request.headers.delete("x-api-key")
-            if (!credential) {
+            if (credential?.type !== "oauth") {
               event.request.headers.delete("authorization")
               replays.delete(event.request)
               return
@@ -227,7 +206,7 @@ export function createKimiPlugin(dependencies: PluginDependencies = {}) {
               request: event.request,
               response: event.response,
               replay,
-              store: credentials,
+              connections: ctx.integration.connection,
               send,
             })
           }),
