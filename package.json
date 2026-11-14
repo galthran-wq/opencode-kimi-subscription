@@ -1,0 +1,28 @@
+{
+  "name": "opencode-kimi-subscription-v2",
+  "version": "0.2.0",
+  "description": "Kimi Code subscription provider for OpenCode 2",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/galthran-wq/opencode-kimi-subscription.git"
+  },
+  "keywords": ["opencode", "opencode-plugin", "kimi", "moonshot"],
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.5",
+    "effect": "4.0.6"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "typescript": "6.0.2"
+  }
+}
