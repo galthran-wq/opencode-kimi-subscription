@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from "bun:test"
 import { Effect, Stream } from "effect"
 import { Credential, Model, Provider } from "@opencode/plugin/effect"
 import type { ConnectionInfo } from "@opencode/client"
+import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect/integration"
 import { METHOD_ID, PROVIDER_ID, STATIC_MODELS } from "../internal.ts"
 import type { Fetch } from "../oauth.ts"
 import { createKimiPlugin } from "../plugin.ts"
@@ -22,7 +23,7 @@ const modelsResponse = () =>
 
 interface HarnessOptions {
   readonly active?: () => ConnectionInfo | undefined
-  readonly credentials?: ReadonlyMap<string, Credential.OAuth>
+  readonly credentials?: Map<string, Credential.OAuth>
   readonly storage?: Map<string, unknown>
   readonly send?: Fetch
 }
@@ -34,13 +35,16 @@ function createHarness(options: HarnessOptions = {}) {
   const send = options.send ?? mock(async () => modelsResponse())
   let added: { info: Provider.Info; models: readonly Model.Info[]; sourceConnection?: ConnectionInfo } | undefined
   let providerTransform: ((editor: unknown) => void) | undefined
-  let oauthMethod: { method: { label: string } } | undefined
+  let oauthMethod: IntegrationOAuthMethodRegistration | undefined
   let reloads = 0
   const hooks: { name: string; callback: (event: any) => Effect.Effect<any, any> }[] = []
   const commands: { name: string; description?: string; execute: (input: any) => Effect.Effect<void, unknown> }[] = []
   const synthetics: Record<string, unknown>[] = []
   let prompts = 0
   let generations = 0
+  const resolve = mock((selected: ConnectionInfo) =>
+    Effect.succeed(selected.type === "credential" ? credentials.get(selected.id) : undefined),
+  )
 
   const ctx = {
     storage: {
@@ -53,8 +57,7 @@ function createHarness(options: HarnessOptions = {}) {
     integration: {
       connection: {
         active: () => Effect.sync(active),
-        resolve: (selected: ConnectionInfo) =>
-          Effect.succeed(selected.type === "credential" ? credentials.get(selected.id) : undefined),
+        resolve,
       },
       transform: (callback: (editor: any) => void) => {
         callback({
@@ -136,6 +139,8 @@ function createHarness(options: HarnessOptions = {}) {
     synthetics,
     send,
     storage,
+    credentials,
+    resolve,
     promptCalls: () => prompts,
     generationCalls: () => generations,
     added: () => added,
@@ -204,7 +209,43 @@ describe("V2 plugin setup", () => {
       .toHaveLength(2)
   })
 
-  test("uses a refreshed token for the 401 replay and the subsequent request", async () => {
+  test("registers Core's refresh callback and uses the rotated credential Core persists", async () => {
+    const send = mock(async (input: string | URL | Request) => {
+      if (String(input).startsWith("https://auth.example.test/")) {
+        return Response.json({ access_token: "access-new", refresh_token: "refresh-new", expires_in: 900 })
+      }
+      return modelsResponse()
+    })
+    const harness = createHarness({
+      credentials: new Map([[connection.id, oauth("access-old", "refresh-old")]]),
+      send,
+    })
+    await setup(harness)
+    const refresh = harness.oauthMethod()?.refresh
+    expect(refresh).toBeDefined()
+    if (!refresh) throw new Error("OAuth refresh must remain registered for Core")
+
+    const current = harness.credentials.get(connection.id)!
+    const refreshed = await Effect.runPromise(refresh(current))
+    expect(refreshed.access).toBe("access-new")
+    expect(refreshed.refresh).toBe("refresh-new")
+
+    // Core owns persistence: its credential store is represented by this map, not plugin storage.
+    harness.credentials.set(connection.id, refreshed)
+    const requestHook = hook(harness, "http.request")
+    for (let index = 0; index < 2; index++) {
+      const request = new Request("https://api.example.test/coding/v1/chat/completions", {
+        headers: { Authorization: "Bearer access-old" },
+      })
+      await Effect.runPromise(requestHook({ request }))
+      expect(request.headers.get("authorization")).toBe("Bearer access-new")
+    }
+
+    expect(send.mock.calls.filter(([input]) => String(input).startsWith("https://auth.example.test/"))).toHaveLength(1)
+    expect(harness.storage.get(`oauth/${connection.id}`)).toBeUndefined()
+  })
+
+  test("replays a rejected request only with a different token resolved from Core", async () => {
     const replays: Request[] = []
     const send = mock(async (input: string | URL | Request) => {
       if (input instanceof Request) {
@@ -212,7 +253,7 @@ describe("V2 plugin setup", () => {
         return new Response("recovered", { status: 200 })
       }
       if (String(input).startsWith("https://auth.example.test/")) {
-        return Response.json({ access_token: "access-new", refresh_token: "refresh-new", expires_in: 900 })
+        throw new Error("The plugin must not refresh OAuth credentials")
       }
       return modelsResponse()
     })
@@ -232,6 +273,9 @@ describe("V2 plugin setup", () => {
     await Effect.runPromise(requestHook({ request }))
     expect(request.headers.get("authorization")).toBe("Bearer access-old")
     expect(request.headers.get("x-api-key")).toBeNull()
+
+    // Core refreshes and persists independently; the next resolve observes its current value.
+    harness.credentials.set(connection.id, oauth("access-new", "refresh-new"))
     const responseEvent = { request, response: new Response("rejected", { status: 401 }) }
     await Effect.runPromise(responseHook(responseEvent))
 
@@ -244,8 +288,31 @@ describe("V2 plugin setup", () => {
     })
     await Effect.runPromise(requestHook({ request: subsequent }))
     expect(subsequent.headers.get("authorization")).toBe("Bearer access-new")
-    const persisted = harness.storage.get(`oauth/${connection.id}`) as { credential: Credential.OAuth }
-    expect(persisted.credential.refresh).toBe("refresh-new")
+    expect(harness.storage.get(`oauth/${connection.id}`)).toBeUndefined()
+  })
+
+  test("does not refresh or replay when Core resolves the rejected token unchanged", async () => {
+    const send = mock(async (input: string | URL | Request) => {
+      if (input instanceof Request || String(input).startsWith("https://auth.example.test/")) {
+        throw new Error("The plugin must not refresh or replay an unchanged credential")
+      }
+      return modelsResponse()
+    })
+    const harness = createHarness({
+      credentials: new Map([[connection.id, oauth("access-old", "refresh-old")]]),
+      send,
+    })
+    await setup(harness)
+    const request = new Request("https://api.example.test/coding/v1/chat/completions")
+    await Effect.runPromise(hook(harness, "http.request")({ request }))
+    const original = new Response("rejected", { status: 403 })
+    const responseEvent = { request, response: original }
+
+    await Effect.runPromise(hook(harness, "http.response")(responseEvent))
+
+    expect(responseEvent.response).toBe(original)
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(harness.storage.get(`oauth/${connection.id}`)).toBeUndefined()
   })
 
   test("does not reuse credentials across account switches or without an active connection", async () => {
